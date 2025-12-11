@@ -1,3 +1,25 @@
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// EXIF tag IDs
+const EXIF_TAG_EXIF_IFD = 0x8769;        // Pointer to Exif IFD
+const EXIF_TAG_USER_COMMENT = 0x9286;    // UserComment tag
+
+// TIFF constants
+const TIFF_MAGIC_NUMBER = 42;
+const TIFF_LITTLE_ENDIAN = 'II';
+const TIFF_BIG_ENDIAN = 'MM';
+
+// UserComment encoding prefixes (8 bytes)
+const USER_COMMENT_UNICODE_PREFIX = 'UNICODE';
+const USER_COMMENT_ASCII_PREFIX = 'ASCII';
+const USER_COMMENT_PREFIX_LENGTH = 8;
+
+// =============================================================================
+// DOM ELEMENTS
+// =============================================================================
+
 const dropZone = document.getElementById('dropZone');
 const dropText = document.getElementById('dropText');
 const preview = document.getElementById('preview');
@@ -13,6 +35,26 @@ const modalClose = document.getElementById('modalClose');
 
 let currentWorkflow = null;
 let currentFileName = 'workflow';
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+function copyToClipboard(text, button) {
+  navigator.clipboard.writeText(text).then(() => {
+    const originalText = button.textContent;
+    button.textContent = 'Copied!';
+    button.classList.add('copied');
+    setTimeout(() => {
+      button.textContent = originalText;
+      button.classList.remove('copied');
+    }, 1500);
+  });
+}
+
+// =============================================================================
+// UI EVENT HANDLERS
+// =============================================================================
 
 // Modal handlers
 infoBtn.addEventListener('click', () => {
@@ -82,15 +124,7 @@ downloadBtn.addEventListener('click', () => {
 
 copyJsonBtn.addEventListener('click', () => {
   if (!currentWorkflow) return;
-
-  navigator.clipboard.writeText(JSON.stringify(currentWorkflow, null, 2)).then(() => {
-    copyJsonBtn.textContent = 'Copied!';
-    copyJsonBtn.classList.add('copied');
-    setTimeout(() => {
-      copyJsonBtn.textContent = 'Copy';
-      copyJsonBtn.classList.remove('copied');
-    }, 1500);
-  });
+  copyToClipboard(JSON.stringify(currentWorkflow, null, 2), copyJsonBtn);
 });
 
 async function handleFile(file) {
@@ -178,51 +212,102 @@ async function handleFile(file) {
   }
 }
 
-function detectAndExtract(metadata, fileInfo = {}) {
-  // Get the text content from metadata based on file type
-  let textContent = null;
+// =============================================================================
+// METADATA EXTRACTION
+// =============================================================================
 
+function getTextContent(metadata, fileInfo = {}) {
   // For PNG: parameters field contains the text directly
   if (fileInfo.isPng && metadata.parameters) {
-    textContent = metadata.parameters;
+    return metadata.parameters;
   }
   // For JPEG/WEBP: userComment may be a Uint8Array that needs decoding
-  else if (metadata.userComment) {
-    textContent = decodeUserComment(metadata.userComment);
+  if (metadata.userComment) {
+    return decodeUserComment(metadata.userComment);
   }
   // Fallback to other common fields
-  else if (metadata.ImageDescription) {
-    textContent = metadata.ImageDescription;
+  if (metadata.ImageDescription) {
+    return metadata.ImageDescription;
   }
-  else if (metadata.description) {
-    textContent = metadata.description;
+  if (metadata.description) {
+    return metadata.description;
+  }
+  return null;
+}
+
+function parseComfyUIFromText(textContent) {
+  // Custom save node format: "Workflow: {...}"
+  if (!textContent.includes('Workflow:')) {
+    return null;
   }
 
+  const workflowMatch = textContent.match(/Workflow:\s*(\{[\s\S]*\})/);
+  if (!workflowMatch) {
+    return null;
+  }
+
+  const jsonStr = extractBalancedJson(workflowMatch[1]);
+  if (!jsonStr) {
+    return null;
+  }
+
+  try {
+    const workflow = JSON.parse(jsonStr);
+    return {
+      source: 'comfyui',
+      workflow: workflow,
+      prompts: extractComfyUIPrompts(workflow)
+    };
+  } catch (e) {
+    console.error('Failed to parse ComfyUI JSON:', e);
+    return null;
+  }
+}
+
+function parseComfyUIFromWorkflowField(metadata) {
+  // Default ComfyUI SaveImage node stores workflow directly in 'workflow' field
+  const workflowStr = metadata.workflow || metadata.Workflow;
+  if (!workflowStr || typeof workflowStr !== 'string') {
+    return null;
+  }
+
+  try {
+    const workflow = JSON.parse(workflowStr);
+    // Verify it looks like a ComfyUI workflow
+    if (!workflow.nodes || !Array.isArray(workflow.nodes)) {
+      return null;
+    }
+    return {
+      source: 'comfyui',
+      workflow: workflow,
+      prompts: extractComfyUIPrompts(workflow)
+    };
+  } catch (e) {
+    console.error('Failed to parse ComfyUI workflow field:', e);
+    return null;
+  }
+}
+
+function detectAndExtract(metadata, fileInfo = {}) {
+  // Try default ComfyUI format first (direct workflow field)
+  const comfyFromField = parseComfyUIFromWorkflowField(metadata);
+  if (comfyFromField) {
+    return comfyFromField;
+  }
+
+  // Get text content for other formats
+  const textContent = getTextContent(metadata, fileInfo);
   if (!textContent) {
     return null;
   }
 
-  // Check for ComfyUI workflow
-  if (textContent.includes('Workflow:')) {
-    const workflowMatch = textContent.match(/Workflow:\s*(\{[\s\S]*\})/);
-    if (workflowMatch) {
-      const jsonStr = extractBalancedJson(workflowMatch[1]);
-      if (jsonStr) {
-        try {
-          const workflow = JSON.parse(jsonStr);
-          return {
-            source: 'comfyui',
-            workflow: workflow,
-            prompts: extractComfyUIPrompts(workflow)
-          };
-        } catch (e) {
-          console.error('Failed to parse ComfyUI JSON:', e);
-        }
-      }
-    }
+  // Try custom ComfyUI save node format (Workflow: prefix in ImageDescription)
+  const comfyFromText = parseComfyUIFromText(textContent);
+  if (comfyFromText) {
+    return comfyFromText;
   }
 
-  // Check for A1111 format
+  // Try A1111 format
   if (isA1111Format(textContent)) {
     return {
       source: 'a1111',
@@ -233,6 +318,10 @@ function detectAndExtract(metadata, fileInfo = {}) {
   return null;
 }
 
+// =============================================================================
+// BINARY PARSERS (EXIF/TIFF/RIFF)
+// =============================================================================
+
 function decodeUserComment(data) {
   // userComment can be a string, Uint8Array, or other format
   if (typeof data === 'string') {
@@ -242,11 +331,11 @@ function decodeUserComment(data) {
   if (data instanceof Uint8Array || ArrayBuffer.isView(data)) {
     // Check for encoding prefix (first 8 bytes indicate encoding)
     // Common prefixes: "ASCII\0\0\0", "UNICODE\0", "JIS\0\0\0\0\0"
-    const prefix = new TextDecoder('ascii').decode(data.slice(0, 8));
+    const prefix = new TextDecoder('ascii').decode(data.slice(0, USER_COMMENT_PREFIX_LENGTH));
 
-    if (prefix.startsWith('UNICODE')) {
+    if (prefix.startsWith(USER_COMMENT_UNICODE_PREFIX)) {
       // UTF-16 Big Endian encoding, skip the 8-byte prefix
-      const textData = data.slice(8);
+      const textData = data.slice(USER_COMMENT_PREFIX_LENGTH);
       // Decode as UTF-16 BE
       let result = '';
       for (let i = 0; i < textData.length - 1; i += 2) {
@@ -255,9 +344,9 @@ function decodeUserComment(data) {
         result += String.fromCharCode(charCode);
       }
       return result;
-    } else if (prefix.startsWith('ASCII')) {
+    } else if (prefix.startsWith(USER_COMMENT_ASCII_PREFIX)) {
       // ASCII encoding, skip the 8-byte prefix
-      return new TextDecoder('ascii').decode(data.slice(8));
+      return new TextDecoder('ascii').decode(data.slice(USER_COMMENT_PREFIX_LENGTH));
     } else {
       // Try UTF-8 as fallback
       return new TextDecoder('utf-8').decode(data);
@@ -268,116 +357,156 @@ function decodeUserComment(data) {
 }
 
 function extractWebpExif(arrayBuffer) {
-  // WEBP files store EXIF in a RIFF chunk named 'EXIF'
-  const data = new Uint8Array(arrayBuffer);
+  try {
+    // WEBP files store EXIF in a RIFF chunk named 'EXIF'
+    const data = new Uint8Array(arrayBuffer);
 
-  // Verify RIFF/WEBP header
-  const riff = String.fromCharCode(...data.slice(0, 4));
-  const webp = String.fromCharCode(...data.slice(8, 12));
-
-  if (riff !== 'RIFF' || webp !== 'WEBP') {
-    return null;
-  }
-
-  // Search for EXIF chunk
-  let pos = 12;
-  while (pos < data.length - 8) {
-    const chunkId = String.fromCharCode(...data.slice(pos, pos + 4));
-    const chunkSize = data[pos + 4] | (data[pos + 5] << 8) | (data[pos + 6] << 16) | (data[pos + 7] << 24);
-
-    if (chunkId === 'EXIF') {
-      // Found EXIF chunk, parse TIFF/EXIF structure
-      const exifData = data.slice(pos + 8, pos + 8 + chunkSize);
-      return parseExifData(exifData);
+    // Need at least 12 bytes for RIFF header
+    if (data.length < 12) {
+      return null;
     }
 
-    // Move to next chunk (chunks are padded to even size)
-    pos += 8 + chunkSize + (chunkSize % 2);
-  }
+    // Verify RIFF/WEBP header
+    const riff = String.fromCharCode(...data.slice(0, 4));
+    const webp = String.fromCharCode(...data.slice(8, 12));
 
-  return null;
+    if (riff !== 'RIFF' || webp !== 'WEBP') {
+      return null;
+    }
+
+    // Search for EXIF chunk
+    let pos = 12;
+    while (pos < data.length - 8) {
+      const chunkId = String.fromCharCode(...data.slice(pos, pos + 4));
+      const chunkSize = data[pos + 4] | (data[pos + 5] << 8) | (data[pos + 6] << 16) | (data[pos + 7] << 24);
+
+      // Sanity check chunk size
+      if (chunkSize < 0 || pos + 8 + chunkSize > data.length) {
+        break;
+      }
+
+      if (chunkId === 'EXIF') {
+        // Found EXIF chunk, parse TIFF/EXIF structure
+        const exifData = data.slice(pos + 8, pos + 8 + chunkSize);
+        return parseExifData(exifData);
+      }
+
+      // Move to next chunk (chunks are padded to even size)
+      pos += 8 + chunkSize + (chunkSize % 2);
+    }
+
+    return null;
+  } catch (e) {
+    console.error('Error parsing WEBP EXIF:', e);
+    return null;
+  }
 }
 
 function parseExifData(exifData) {
-  // EXIF data starts with TIFF header
-  // Byte order: 'MM' (big-endian) or 'II' (little-endian)
-  const byteOrder = String.fromCharCode(exifData[0], exifData[1]);
-  const isLittleEndian = byteOrder === 'II';
-
-  function readUint16(offset) {
-    if (isLittleEndian) {
-      return exifData[offset] | (exifData[offset + 1] << 8);
+  try {
+    // Need at least 8 bytes for TIFF header
+    if (!exifData || exifData.length < 8) {
+      return null;
     }
-    return (exifData[offset] << 8) | exifData[offset + 1];
-  }
 
-  function readUint32(offset) {
-    if (isLittleEndian) {
-      return exifData[offset] | (exifData[offset + 1] << 8) |
-             (exifData[offset + 2] << 16) | (exifData[offset + 3] << 24);
-    }
-    return (exifData[offset] << 24) | (exifData[offset + 1] << 16) |
-           (exifData[offset + 2] << 8) | exifData[offset + 3];
-  }
+    // EXIF data starts with TIFF header
+    // Byte order: 'MM' (big-endian) or 'II' (little-endian)
+    const byteOrder = String.fromCharCode(exifData[0], exifData[1]);
+    const isLittleEndian = byteOrder === TIFF_LITTLE_ENDIAN;
 
-  // Verify TIFF magic number (42)
-  if (readUint16(2) !== 42) {
-    return null;
-  }
-
-  // Get offset to first IFD
-  let ifdOffset = readUint32(4);
-
-  // Search through IFDs for ExifIFD (tag 0x8769)
-  while (ifdOffset > 0 && ifdOffset < exifData.length - 2) {
-    const numEntries = readUint16(ifdOffset);
-    let exifIfdOffset = 0;
-
-    for (let i = 0; i < numEntries; i++) {
-      const entryOffset = ifdOffset + 2 + (i * 12);
-      const tag = readUint16(entryOffset);
-
-      if (tag === 0x8769) {
-        // ExifIFD pointer
-        exifIfdOffset = readUint32(entryOffset + 8);
-        break;
+    function readUint16(offset) {
+      if (offset + 2 > exifData.length) return 0;
+      if (isLittleEndian) {
+        return exifData[offset] | (exifData[offset + 1] << 8);
       }
+      return (exifData[offset] << 8) | exifData[offset + 1];
     }
 
-    if (exifIfdOffset > 0) {
-      // Parse ExifIFD for UserComment (tag 0x9286)
-      const exifNumEntries = readUint16(exifIfdOffset);
+    function readUint32(offset) {
+      if (offset + 4 > exifData.length) return 0;
+      if (isLittleEndian) {
+        return exifData[offset] | (exifData[offset + 1] << 8) |
+               (exifData[offset + 2] << 16) | (exifData[offset + 3] << 24);
+      }
+      return (exifData[offset] << 24) | (exifData[offset + 1] << 16) |
+             (exifData[offset + 2] << 8) | exifData[offset + 3];
+    }
 
-      for (let i = 0; i < exifNumEntries; i++) {
-        const entryOffset = exifIfdOffset + 2 + (i * 12);
+    // Verify TIFF magic number (42)
+    if (readUint16(2) !== TIFF_MAGIC_NUMBER) {
+      return null;
+    }
+
+    // Get offset to first IFD
+    let ifdOffset = readUint32(4);
+
+    // Search through IFDs for ExifIFD
+    while (ifdOffset > 0 && ifdOffset < exifData.length - 2) {
+      const numEntries = readUint16(ifdOffset);
+      let exifIfdOffset = 0;
+
+      for (let i = 0; i < numEntries; i++) {
+        const entryOffset = ifdOffset + 2 + (i * 12);
+        if (entryOffset + 12 > exifData.length) break;
+
         const tag = readUint16(entryOffset);
 
-        if (tag === 0x9286) {
-          // UserComment found
-          const count = readUint32(entryOffset + 4);
-          let valueOffset = entryOffset + 8;
-
-          // If data is > 4 bytes, the value is an offset
-          if (count > 4) {
-            valueOffset = readUint32(entryOffset + 8);
-          }
-
-          const commentData = exifData.slice(valueOffset, valueOffset + count);
-          const userComment = decodeUserComment(commentData);
-
-          return { userComment };
+        if (tag === EXIF_TAG_EXIF_IFD) {
+          // ExifIFD pointer
+          exifIfdOffset = readUint32(entryOffset + 8);
+          break;
         }
       }
+
+      if (exifIfdOffset > 0 && exifIfdOffset < exifData.length) {
+        // Parse ExifIFD for UserComment
+        const exifNumEntries = readUint16(exifIfdOffset);
+
+        for (let i = 0; i < exifNumEntries; i++) {
+          const entryOffset = exifIfdOffset + 2 + (i * 12);
+          if (entryOffset + 12 > exifData.length) break;
+
+          const tag = readUint16(entryOffset);
+
+          if (tag === EXIF_TAG_USER_COMMENT) {
+            // UserComment found
+            const count = readUint32(entryOffset + 4);
+            let valueOffset = entryOffset + 8;
+
+            // If data is > 4 bytes, the value is an offset
+            if (count > 4) {
+              valueOffset = readUint32(entryOffset + 8);
+            }
+
+            // Bounds check before slicing
+            if (valueOffset + count > exifData.length) {
+              return null;
+            }
+
+            const commentData = exifData.slice(valueOffset, valueOffset + count);
+            const userComment = decodeUserComment(commentData);
+
+            return { userComment };
+          }
+        }
+      }
+
+      // Move to next IFD
+      const nextIfdOffset = readUint32(ifdOffset + 2 + (numEntries * 12));
+      if (nextIfdOffset === 0 || nextIfdOffset === ifdOffset) break;
+      ifdOffset = nextIfdOffset;
     }
 
-    // Move to next IFD
-    const nextIfdOffset = readUint32(ifdOffset + 2 + (numEntries * 12));
-    if (nextIfdOffset === 0 || nextIfdOffset === ifdOffset) break;
-    ifdOffset = nextIfdOffset;
+    return null;
+  } catch (e) {
+    console.error('Error parsing EXIF data:', e);
+    return null;
   }
-
-  return null;
 }
+
+// =============================================================================
+// A1111 FORMAT PARSING
+// =============================================================================
 
 function isA1111Format(text) {
   // A1111 format has specific patterns like "Steps:", "Sampler:", "CFG scale:"
@@ -439,6 +568,10 @@ function parseA1111Data(text) {
 
   return result;
 }
+
+// =============================================================================
+// COMFYUI FORMAT PARSING
+// =============================================================================
 
 function extractComfyUIPrompts(workflow) {
   const prompts = {
@@ -526,6 +659,10 @@ function extractComfyUIPrompts(workflow) {
 
   return prompts;
 }
+
+// =============================================================================
+// UI DISPLAY FUNCTIONS
+// =============================================================================
 
 function displayComfyUIData(result) {
   promptsPanel.innerHTML = '';
@@ -643,14 +780,7 @@ function addPromptSection(type, title, text, isEmpty = false) {
     copyBtn.textContent = 'Copy';
     copyBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      navigator.clipboard.writeText(text).then(() => {
-        copyBtn.textContent = 'Copied!';
-        copyBtn.classList.add('copied');
-        setTimeout(() => {
-          copyBtn.textContent = 'Copy';
-          copyBtn.classList.remove('copied');
-        }, 1500);
-      });
+      copyToClipboard(text, copyBtn);
     });
     header.appendChild(copyBtn);
   }
@@ -677,6 +807,10 @@ function updateSourceBadge(source) {
   badge.textContent = source === 'comfyui' ? 'ComfyUI' : 'A1111';
   fileInfo.appendChild(badge);
 }
+
+// =============================================================================
+// STRING/JSON HELPERS
+// =============================================================================
 
 function extractBalancedJson(str) {
   let braceCount = 0;
