@@ -27,7 +27,12 @@ AI image generators embed metadata in different locations depending on the tool 
 
 ### ComfyUI
 
-ComfyUI stores the complete workflow JSON in the image's `ImageDescription` field, prefixed with `Workflow:`. The extractor:
+ComfyUI embeds workflow data in two ways depending on which save node is used:
+
+- **Default SaveImage node** (PNG only) - Stores `workflow` and `prompt` as separate PNG tEXt chunks
+- **Custom save nodes** - Store workflow JSON in the `ImageDescription` field with a `Workflow:` prefix
+
+The extractor supports both formats and:
 
 - Parses the workflow JSON to find prompt nodes
 - Extracts text from `CLIPTextEncode` and `CLIPTextEncodeFlux` nodes
